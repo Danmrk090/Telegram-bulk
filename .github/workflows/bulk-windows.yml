@@ -325,7 +325,7 @@ jobs:
 
       - name: Configure pagefile.
         if: steps.credentials.outputs.ok == 'true'
-        uses: al-cheb/configure-pagefile-action@v1.4
+        uses: al-cheb/configure-pagefile-action@v1.5
         with:
           minimum-size: 16GB
           maximum-size: 40GB
