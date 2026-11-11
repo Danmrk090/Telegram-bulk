@@ -297,6 +297,12 @@ private:
 	void loadFilePart();
 	void sendFilePart(int64 offset);
 	void cancelFileParts();
+	void scheduleFileWatchdog();
+	void fileWatchdogTick(uint64 generation);
+	void fileStalled();
+	void fileFloodWait(int64 offset, int seconds);
+	void recordSkippedFile(const QString &reason);
+	[[nodiscard]] QString fileProgressPath() const;
 	void filePartFailed(int64 offset, const MTP::Error &error);
 	void filePartDone(int64 offset, const MTPupload_File &result);
 	void filePartUnavailable();
@@ -340,6 +346,9 @@ private:
 	void ioError(const Output::Result &result);
 
 	MTP::ConcurrentSender _mtp;
+	Fn<void(FnMut<void()>)> _runner;
+	uint64 _watchdogGeneration = 0;
+	bool _watchdogScheduled = false;
 	std::optional<uint64> _takeoutId;
 	std::optional<UserId> _selfId;
 	Output::Stats *_stats = nullptr;
@@ -359,7 +368,11 @@ private:
 	std::unique_ptr<DialogsProcess> _dialogsProcess;
 	std::unique_ptr<ChatProcess> _chatProcess;
 	std::unique_ptr<TopicProcess> _topicProcess;
-	base::flat_map<not_null<Data::File*>, mtpRequestId> _prefetchRequests;
+	struct PrefetchRequest {
+		mtpRequestId requestId = 0;
+		crl::time sent = 0;
+	};
+	base::flat_map<not_null<Data::File*>, PrefetchRequest> _prefetchRequests;
 	base::flat_set<not_null<Data::File*>> _prefetchDone;
 	uint64 _prefetchGeneration = 0;
 	bool _prefetchWaiting = false;

@@ -15,6 +15,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/bytes.h"
 #include "base/options.h"
 #include "base/random.h"
+#include "base/call_delayed.h"
+#include "logs.h"
+
+#include <QtCore/QFile>
 #include <set>
 #include <deque>
 
@@ -31,6 +35,32 @@ constexpr auto kFileRequestsCount = 8;
 constexpr auto kPrefetchMaxSize = 1024 * 1024;
 constexpr auto kPrefetchParallel = 6;
 constexpr auto kPrefetchAhead = 24;
+
+// A file that gets no data for this long has lost requests: they are sent
+// again, and after a few attempts the file is skipped automatically.
+constexpr auto kWatchdogInterval = crl::time(5000);
+constexpr auto kPrefetchTimeout = crl::time(20000);
+constexpr auto kFileStallTimeout = crl::time(45000);
+constexpr auto kMaxFileStalls = 3;
+constexpr auto kMaxFloodWait = 24 * 60 * 60;
+
+[[nodiscard]] int FloodWaitSeconds(const MTP::Error &error) {
+	const auto type = error.type();
+	if (!type.startsWith(u"FLOOD_WAIT_"_q)
+		&& !type.startsWith(u"FLOOD_PREMIUM_WAIT_"_q)) {
+		return 0;
+	}
+	const auto seconds = type.mid(type.lastIndexOf('_') + 1).toInt();
+	return std::clamp(seconds, 1, kMaxFloodWait);
+}
+
+[[nodiscard]] QString FormatWait(int seconds) {
+	return (seconds < 60)
+		? u"%1 s"_q.arg(seconds)
+		: (seconds < 3600)
+		? u"%1 min"_q.arg((seconds + 59) / 60)
+		: u"%1 h %2 min"_q.arg(seconds / 3600).arg((seconds % 3600) / 60);
+}
 constexpr auto kChatsSliceLimit = 100;
 constexpr auto kMessagesSliceLimit = 100;
 constexpr auto kTopPeerSliceLimit = 100;
@@ -522,6 +552,11 @@ struct ApiWrap::FileProcess {
 	};
 	std::deque<Request> requests;
 	mtpRequestId requestId = 0; // file reference refresh request
+
+	crl::time lastActivity = 0;
+	crl::time floodUntil = 0;
+	int stalls = 0;
+	QString note; // shown next to the file name
 };
 
 struct ApiWrap::FileProgress {
@@ -761,13 +796,15 @@ auto ApiWrap::fileRequest(const Data::FileLocation &location, int64 offset) {
 			return;
 		}
 		filePartFailed(offset, result);
-	}).toDC(MTP::ShiftDcId(location.dcId, MTP::kExportMediaDcShift)));
+	}).handleFloodErrors().toDC(
+		MTP::ShiftDcId(location.dcId, MTP::kExportMediaDcShift)));
 }
 
 ApiWrap::ApiWrap(
 	base::weak_qptr<MTP::Instance> weak,
 	Fn<void(FnMut<void()>)> runner)
-: _mtp(weak, std::move(runner))
+: _mtp(weak, runner)
+, _runner(runner)
 , _fileCache(std::make_unique<LoadedFileCache>(kLocationCacheSize)) {
 }
 
@@ -788,6 +825,7 @@ void ApiWrap::startExport(
 
 	_settings = std::make_unique<Settings>(settings);
 	_stats = stats;
+	scheduleFileWatchdog();
 	_startProcess = std::make_unique<StartProcess>();
 	_startProcess->done = std::move(done);
 
@@ -1877,6 +1915,7 @@ void ApiWrap::skipFile(uint64 randomId) {
 		return;
 	}
 	LOG(("Export Info: File skipped."));
+	recordSkippedFile(u"skipped by you"_q);
 	cancelFileParts();
 	if (_fileProcess->requestId) {
 		_mtp.request(base::take(_fileProcess->requestId)).cancel();
@@ -2868,7 +2907,10 @@ void ApiWrap::prefetchFile(not_null<Data::File*> file) {
 	}).toDC(MTP::ShiftDcId(
 		location.dcId,
 		MTP::kExportMediaDcShift)).send();
-	_prefetchRequests.emplace(file, requestId);
+	_prefetchRequests.emplace(file, PrefetchRequest{
+		.requestId = requestId,
+		.sent = crl::now(),
+	});
 }
 
 void ApiWrap::prefetchFinished(
@@ -2893,10 +2935,170 @@ void ApiWrap::prefetchFinished(
 	}
 }
 
+void ApiWrap::scheduleFileWatchdog() {
+	if (_watchdogScheduled || !_runner) {
+		return;
+	}
+	_watchdogScheduled = true;
+	const auto runner = _runner;
+	const auto generation = _watchdogGeneration;
+	crl::on_main([=] {
+		base::call_delayed(kWatchdogInterval, [=] {
+			runner([=] {
+				fileWatchdogTick(generation);
+			});
+		});
+	});
+}
+
+void ApiWrap::fileWatchdogTick(uint64 generation) {
+	_watchdogScheduled = false;
+	if (generation != _watchdogGeneration || !_settings) {
+		return;
+	}
+	const auto now = crl::now();
+
+	// Small files requested ahead fall back to the usual loading.
+	auto stuck = std::vector<not_null<Data::File*>>();
+	for (const auto &[file, request] : _prefetchRequests) {
+		if (now - request.sent > kPrefetchTimeout) {
+			stuck.push_back(file);
+		}
+	}
+	for (const auto file : stuck) {
+		const auto i = _prefetchRequests.find(file);
+		if (i == end(_prefetchRequests)) {
+			continue;
+		}
+		LOG(("Export Info: Early request of a small file timed out."));
+		_mtp.request(i->second.requestId).cancel();
+		prefetchFinished(_prefetchGeneration, file, QByteArray());
+	}
+
+	if (_fileProcess
+		&& _fileProcess->floodUntil <= now
+		&& _fileProcess->lastActivity > 0
+		&& now - _fileProcess->lastActivity > kFileStallTimeout) {
+		fileStalled();
+	}
+	scheduleFileWatchdog();
+}
+
+void ApiWrap::fileStalled() {
+	Expects(_fileProcess != nullptr);
+
+	auto &process = *_fileProcess;
+	if (++process.stalls > kMaxFileStalls) {
+		LOG(("Export Info: File skipped automatically, no response."));
+		recordSkippedFile(u"no response from Telegram"_q);
+		cancelFileParts();
+		if (process.requestId) {
+			_mtp.request(base::take(process.requestId)).cancel();
+		}
+		base::take(_fileProcess)->done(QString());
+		return;
+	}
+	LOG(("Export Info: File stalled, sending its parts again (%1)."
+		).arg(process.stalls));
+	cancelFileParts();
+	if (process.requestId) {
+		_mtp.request(base::take(process.requestId)).cancel();
+	}
+	process.lastActivity = crl::now();
+	process.note = u" (no response, trying again %1/%2)"_q
+		.arg(process.stalls)
+		.arg(kMaxFileStalls);
+	if (process.progress) {
+		process.progress(FileProgress{ process.file.size(), process.size });
+		if (!_fileProcess) {
+			return;
+		}
+	}
+	auto pending = std::vector<int64>();
+	for (const auto &request : _fileProcess->requests) {
+		if (request.bytes.isEmpty()) {
+			pending.push_back(request.offset);
+		}
+	}
+	for (const auto offset : pending) {
+		sendFilePart(offset);
+	}
+	loadFilePart();
+}
+
+void ApiWrap::fileFloodWait(int64 offset, int seconds) {
+	Expects(_fileProcess != nullptr);
+
+	auto &process = *_fileProcess;
+	const auto now = crl::now();
+	process.floodUntil = std::max(
+		process.floodUntil,
+		now + crl::time(seconds) * 1000);
+	process.lastActivity = process.floodUntil;
+	process.note = u" (Telegram asked to wait %1, continuing automatically)"_q
+		.arg(FormatWait(seconds));
+	LOG(("Export Info: File part flood wait %1 seconds.").arg(seconds));
+	if (process.progress) {
+		process.progress(FileProgress{ process.file.size(), process.size });
+		if (!_fileProcess) {
+			return;
+		}
+	}
+	const auto randomId = process.randomId;
+	const auto runner = _runner;
+	const auto delay = crl::time(seconds) * 1000 + 500;
+	crl::on_main([=] {
+		base::call_delayed(delay, [=] {
+			runner([=] {
+				if (!_fileProcess
+					|| _fileProcess->randomId != randomId
+					|| _fileProcess->requestId) {
+					return;
+				}
+				auto &requests = _fileProcess->requests;
+				const auto i = ranges::find(
+					requests,
+					offset,
+					&FileProcess::Request::offset);
+				if (i == end(requests)
+					|| i->requestId
+					|| !i->bytes.isEmpty()) {
+					return;
+				}
+				_fileProcess->note = QString();
+				_fileProcess->lastActivity = crl::now();
+				sendFilePart(offset);
+			});
+		});
+	});
+}
+
+void ApiWrap::recordSkippedFile(const QString &reason) {
+	if (!_settings || !_fileProcess) {
+		return;
+	}
+	auto file = QFile(_settings->path + u"skipped_files.txt"_q);
+	if (file.open(QIODevice::Append | QIODevice::Text)) {
+		const auto line = _fileProcess->relativePath
+			+ u"\t"_q
+			+ QString::number(_fileProcess->size)
+			+ u" bytes\t"_q
+			+ reason
+			+ '\n';
+		file.write(line.toUtf8());
+	}
+}
+
+QString ApiWrap::fileProgressPath() const {
+	return _fileProcess
+		? (_fileProcess->relativePath + _fileProcess->note)
+		: QString();
+}
+
 void ApiWrap::cancelPrefetch() {
 	++_prefetchGeneration;
-	for (const auto &[file, requestId] : base::take(_prefetchRequests)) {
-		_mtp.request(requestId).cancel();
+	for (const auto &[file, request] : base::take(_prefetchRequests)) {
+		_mtp.request(request.requestId).cancel();
 	}
 	_prefetchDone.clear();
 	_prefetchWaiting = false;
@@ -2945,7 +3147,7 @@ bool ApiWrap::loadMessageFileProgress(int index, FileProgress progress) {
 
 	return _chatProcess->fileProgress(DownloadProgress{
 		.randomId = _fileProcess->randomId,
-		.path = _fileProcess->relativePath,
+		.path = fileProgressPath(),
 		.itemIndex = index,
 		.ready = progress.ready,
 		.total = progress.total });
@@ -3324,7 +3526,7 @@ bool ApiWrap::loadTopicMessageFileProgress(
 
 	return _topicProcess->fileProgress(DownloadProgress{
 		.randomId = _fileProcess->randomId,
-		.path = _fileProcess->relativePath,
+		.path = fileProgressPath(),
 		.itemIndex = index,
 		.ready = progress.ready,
 		.total = progress.total });
@@ -3478,6 +3680,7 @@ void ApiWrap::loadFile(
 	_fileProcess = prepareFileProcess(file, origin);
 	_fileProcess->progress = std::move(progress);
 	_fileProcess->done = std::move(done);
+	_fileProcess->lastActivity = crl::now();
 
 	if (_fileProcess->progress) {
 		const auto progress = FileProgress{
@@ -3595,6 +3798,8 @@ void ApiWrap::filePartFailed(int64 offset, const MTP::Error &result) {
 		if (!_fileProcess->requestId) {
 			filePartRefreshReference(offset);
 		}
+	} else if (const auto seconds = FloodWaitSeconds(result)) {
+		fileFloodWait(offset, seconds);
 	} else {
 		cancelFileParts();
 		error(result);
@@ -3616,6 +3821,8 @@ void ApiWrap::filePartDone(int64 offset, const MTPupload_File &result) {
 		}
 		i->requestId = 0;
 	}
+	_fileProcess->lastActivity = crl::now();
+	_fileProcess->note = QString();
 	if (result.type() == mtpc_upload_fileCdnRedirect) {
 		cancelFileParts();
 		error("Cdn redirect is not supported.");
@@ -3691,6 +3898,7 @@ void ApiWrap::filePartRetryReference(
 	Expects(_fileProcess->requestId == 0);
 
 	_fileProcess->location = std::move(location);
+	_fileProcess->lastActivity = crl::now();
 
 	auto pending = std::vector<int64>();
 	for (const auto &request : _fileProcess->requests) {
